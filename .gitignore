@@ -1,0 +1,10 @@
+/target
+.DS_Store
+
+.agent/
+.pi/
+.omp/
+.claude/
+.codex/
+.opencode/
+.commandcode/
