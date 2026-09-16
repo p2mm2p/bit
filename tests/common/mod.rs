@@ -405,6 +405,7 @@ pub struct Pty {
     parser: vt100::Parser,
     raw: Vec<u8>,
     calls: PathBuf,
+    eof: bool,
 }
 
 impl Pty {
@@ -418,6 +419,7 @@ impl Pty {
             parser: vt100::Parser::new(ROWS, COLS, 0),
             raw: Vec::new(),
             calls: fixture.calls.clone(),
+            eof: false,
         }
     }
 
@@ -465,12 +467,21 @@ impl Pty {
 
     /// 等 bit 退出并给出退出码；超时 panic（先 kill 再报）。
     pub fn exit_code(&mut self) -> i32 {
-        match wait_exit(&mut self.session, TIMEOUT) {
-            Some(code) => code,
-            None => {
-                self.kill();
-                panic!("{TIMEOUT:?} 内 bit 没退出\n{}", self.dump());
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.drain();
+            if let Some(code) = poll_exit(&mut self.session, self.eof) {
+                return code;
             }
+            if Instant::now() >= deadline {
+                self.kill();
+                let eof = self.eof;
+                panic!(
+                    "{TIMEOUT:?} 内 bit 没退出（pty 主端 EOF={eof}）\n{}",
+                    self.dump()
+                );
+            }
+            std::thread::sleep(POLL);
         }
     }
 
@@ -492,18 +503,25 @@ impl Pty {
         )
     }
 
-    /// 把 pty 上现有的字节倒干净：喂解析器、留原始流。
+    /// 把 pty 上现有的字节倒干净：喂解析器、留原始流；读到尽头就记下 EOF。
     fn drain(&mut self) {
         let mut buf = [0u8; 4096];
         loop {
             match self.session.try_read(&mut buf) {
-                Ok(0) => return,
+                Ok(0) => {
+                    self.eof = true;
+                    return;
+                }
                 Ok(n) => {
                     self.raw.extend_from_slice(&buf[..n]);
                     self.parser.process(&buf[..n]);
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => return,
+                // 其余读错误（macOS 上子进程退出后主端就是 EIO）同样意味着这一侧结束了
+                Err(_) => {
+                    self.eof = true;
+                    return;
+                }
             }
         }
     }
@@ -536,32 +554,35 @@ fn set_size(session: &mut OsSession) {
 
 /// 退出码：Unix 是 `WaitStatus`，Windows 的 ConPTY 是裸 `u32`（#13 的实测），
 /// 平台差异只发生在这一处。
+///
+/// Unix 侧以 **pty 主端 EOF** 为准：macOS 实测（CI 首跑）里进程明明干完活退出了，
+/// `PtyProcess::status()`（`waitpid(WNOHANG)`）却一直报 `StillAlive`，于是 e2e 假设失败。
+/// 主端读到尽头就说明子进程那一侧已经关了，这时再用阻塞 `wait()` 收退出码。
 #[cfg(unix)]
-fn wait_exit(session: &mut OsSession, timeout: Duration) -> Option<i32> {
+fn poll_exit(session: &mut OsSession, eof: bool) -> Option<i32> {
     use expectrl::process::unix::WaitStatus;
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        match session.get_process_mut().status() {
-            Ok(WaitStatus::StillAlive) => {
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(POLL);
-            }
-            Ok(WaitStatus::Exited(_, code)) => return Some(code),
-            Ok(other) => panic!("bit 不是正常退出：{other:?}"),
-            Err(error) => panic!("取不到 bit 的退出状态：{error}"),
-        }
+    match session.get_process_mut().status() {
+        Ok(WaitStatus::Exited(_, code)) => return Some(code),
+        Ok(WaitStatus::StillAlive) => {}
+        Ok(other) => panic!("bit 不是正常退出：{other:?}"),
+        Err(_) if !eof => return None,
+        Err(error) => panic!("取不到 bit 的退出状态：{error}"),
+    }
+    if !eof {
+        return None;
+    }
+    match session.get_process_mut().wait() {
+        Ok(WaitStatus::Exited(_, code)) => Some(code),
+        Ok(other) => panic!("bit 不是正常退出：{other:?}"),
+        Err(error) => panic!("wait 拿不到退出码：{error}"),
     }
 }
 
+/// 见 Unix 侧的说明：Windows 的 `wait(Some(0))` 就是「还在跑吗」的答案。
 #[cfg(windows)]
-fn wait_exit(session: &mut OsSession, timeout: Duration) -> Option<i32> {
-    match session
-        .get_process_mut()
-        .wait(Some(timeout.as_millis() as u32))
-    {
+fn poll_exit(session: &mut OsSession, _eof: bool) -> Option<i32> {
+    match session.get_process_mut().wait(Some(0)) {
         Ok(code) => Some(code as i32),
         Err(_) => None,
     }
