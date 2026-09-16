@@ -200,3 +200,38 @@ let (row, col) = screen.cursor_position();      // 光标位置也可断言
 9. `inquire` 0.9.4 元数据（后端为 crossterm，默认 feature） — <https://crates.io/api/v1/crates/inquire>
 10. 交互库本机一手实测（非 TTY、取消、headless 钩子缺席） — 分支 `prototype/interaction-libs`，
     `prototype/interaction-libs/FINDINGS.md`
+
+---
+
+## 6. 实现期实测修订（2026-09-16，随 [实现 · pty e2e 与三平台 CI](https://github.com/p2mm2p/bit/issues/13) 落地）
+
+本文开头写着「未在本机实跑 pty 方案，本机实跑留给实现阶段，届时若与本文不符，以实测为准」。
+实跑之后的修订，以及夹具最终形态（`tests/common/mod.rs`）。
+
+1. **ConPTY 给子进程的标准句柄是「驱动标准句柄的副本」，不是那个伪控制台的。** 把探针跑在 pty 里
+   让它报告自己：驱动被管道喂时，子进程 stdout 的 `GetFileType` 仍是 `FILE_TYPE_PIPE`、stdin 是
+   NUL 设备、`GetConsoleWindow()` 为空——驱动自己都没有控制台。bit 的 TTY 预检因此会把自己拦下，
+   pty 里的输入也送不到它手里。
+2. **要一份真控制台：`Start-Process` 好使，`cmd /C start` 不好使。** 后者把 cmd 自己的管道句柄
+   一并传给子进程（实测：子进程照旧 `is_terminal=false`）；`Start-Process -WindowStyle Hidden`
+   走 ShellExecute，子进程三个流都是控制台。夹具因此是：驱动没有控制台标准流时，用 PowerShell
+   把同一份用例重起一遍（子进程输出躺在隐藏控制台里，失败信息经报告文件回传）。
+3. **编辑器 stub 用「假可执行文件」，不要用脚本。** 第一版是 `.cmd`：同一个 .cmd 从交互 shell
+   手跑没问题，但在 bit 的调用上下文里 cmd 一直报「系统找不到指定的文件。」，bit 于是无限重开
+   编辑器（#13 复审时留痕）。这与 #12 备注里「别用带引号/管道的一整条命令去赌各平台 shell 的
+   转义、用假编辑器可执行文件最稳」一致。最终 stub 是内嵌在夹具里的 Rust 源码，测试进程里用
+   `rustc` 编一次、三平台共用一份。
+4. **发按键前要等界面静下来。** inquire 在提示之间关掉又重开 raw 模式，抢在换模式的那一刻发
+   `\r` 会被控制台丢掉（实测：确认行停在原地、15s 都不动）。夹具的 `expect_screen` 因此是
+   「等到屏幕出现目标文本，再等 120ms 没有新输出」才返回。
+5. **读取与断言**：夹具不用 `expect`（见 §4，ConPTY 会二次渲染、字节流不可作断言），而是
+   `Session::try_read` 轮询、字节全部喂给 `vt100`，断言打在 `screen().contents()` 上；
+   pty 尺寸显式 80×24、Enter 用 `\r`、Esc 用 `\x1b`、Unix 设 `TERM=xterm-256color`。
+6. **退出码**：Windows 走 `conpty::Process::wait(Some(ms)) -> u32`，Unix 走 `PtyProcess::status()`
+   的 `WaitStatus`（非破坏性轮询；`is_alive()` 会顺手 reap，之后就取不到退出码了）。平台差异
+   关在夹具的两个小函数里。
+7. **环境隔离**按 #6 的清单钉死（`HOME` / `USERPROFILE` / `GIT_CONFIG_GLOBAL` /
+   `GIT_CONFIG_NOSYSTEM` / `GIT_PAGER` / `GIT_TERMINAL_PROMPT` / `LC_ALL`），且**不用 `.env()`
+   单加**——conpty 只拼显式 set 过的变量，那样会把 `PATH` 一起丢掉（#13 评论的第 2 条坑）；
+   夹具是 `env_clear()` 后整份搬当前环境、再覆盖要隔离的那几个。
+

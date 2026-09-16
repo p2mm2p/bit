@@ -8,3 +8,8 @@ description = "两个交互命令的 git 包装：bit branch / bit commit"
 
 [dependencies]
 inquire = "=0.9.4"
+
+[dev-dependencies]
+expectrl = "=0.9.0"
+tempfile = "3.27.0"
+vt100 = "0.16.2"

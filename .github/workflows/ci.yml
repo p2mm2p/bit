@@ -1,0 +1,39 @@
+name: CI
+
+# 三平台矩阵，每平台都跑完整的三道门（依据 [测试 · 测试与 CI 策略](https://github.com/p2mm2p/bit/issues/6) 第 3 条、
+# [实现 · pty e2e 与三平台 CI](https://github.com/p2mm2p/bit/issues/13)）：
+# fmt / clippy(-D warnings) / test（含 pty e2e）。Windows 若出现抖动，
+# 降级方案是「Windows 只跑单测与命令面」——一步之差，改 test 一步即可。
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 版本信息
+        run: cargo --version && rustc --version
+
+      - name: 格式
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试（含 pty e2e）
+        run: cargo test
