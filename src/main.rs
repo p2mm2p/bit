@@ -31,19 +31,11 @@ fn run(command: Command) -> ExitCode {
     }
     match command {
         Command::Branch => flow::branch(),
-        Command::Commit => not_implemented(command, "#12"),
+        Command::Commit => flow::commit(),
     }
 }
 
 fn print_line(text: &str) -> ExitCode {
     println!("{text}");
     ExitCode::SUCCESS
-}
-
-fn not_implemented(command: Command, ticket: &str) -> ExitCode {
-    eprintln!(
-        "提示：{} 的交互流程尚未实现（实现见 {ticket}）。",
-        command.label()
-    );
-    ExitCode::from(cli::EXIT_RUNTIME)
 }
