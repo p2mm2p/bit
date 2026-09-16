@@ -238,7 +238,7 @@ impl Fixture {
             .expect("rev-list --count 是数字")
     }
 
-    /// 编辑器 stub 的模式：`write` = 每次写入消息；`loop` = 第一次原样留着、第二次才写入。
+    /// 编辑器 stub 的模式：`write` = 每次写入消息；`quit` = 每次都不动文件就退出（vim 的 `:q`）。
     pub fn editor_mode(&self, mode: &str) {
         fs::write(self.stub_dir.join("mode"), mode).expect("写 stub 模式");
     }
@@ -317,7 +317,7 @@ fn main() {
     let n = fs::read_dir(&calls).expect("读 calls").count();
     fs::copy(&message, calls.join(format!("{n}.txt"))).expect("记一次调用");
     let mode = fs::read_to_string(dir.join("mode")).unwrap_or_default();
-    if mode.trim() == "loop" && n == 0 {
+    if mode.trim() == "quit" {
         return;
     }
     fs::copy(dir.join("message.txt"), &message).expect("写消息");

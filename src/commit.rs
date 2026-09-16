@@ -135,6 +135,32 @@ pub fn is_acceptable(stripped: &str) -> bool {
     }
 }
 
+/// 编辑器每一轮回来后的判决（#16 修订 #4 的「空则重开」：回环有界）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// 描述非空 → 交给 git 提交。
+    Accept,
+    /// 「git 将保存的消息」与上一轮逐字相同 → 用户没打算写，按取消收场。
+    Cancel,
+    /// 改动过但仍不合格 → 带着用户上次保存的原文重开编辑器。
+    Reopen,
+}
+
+/// 逐轮判决：合格提交；与 `previous` 逐字相同 = 未改动即放弃；改动过也不合格才重开——
+/// 循环因此有界，只有内容在变才继续。
+///
+/// `previous` 的初值是种子经 `git stripspace --strip-comments` 的结果：同一个尺子量种子与
+/// 每一轮的产物（ADR-0001），「什么都没写就退出」于是与「写了又改回来」落到同一条判定上。
+pub fn verdict(previous: &str, stripped: &str) -> Verdict {
+    if is_acceptable(stripped) {
+        Verdict::Accept
+    } else if stripped == previous {
+        Verdict::Cancel
+    } else {
+        Verdict::Reopen
+    }
+}
+
 /// `git diff --cached --quiet` 的退出码 → bit 的下一步（#4 第 5 步、#8 表第 8 行）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Staged {
@@ -263,6 +289,28 @@ mod tests {
             is_acceptable("feat(ui):: 双冒号\n"),
             "只做 MUST 级的「描述非空」，header 文法不复核（ADR-0001）"
         );
+    }
+
+    #[test]
+    fn verdict_bounds_the_loop_on_an_unchanged_message() {
+        let seed = "feat(ui):";
+        assert_eq!(verdict(seed, "feat(ui): 加登录页"), Verdict::Accept);
+        assert_eq!(
+            verdict(seed, seed),
+            Verdict::Cancel,
+            "什么都没写就退出编辑器 = 放弃，不在空描述上打转"
+        );
+        assert_eq!(
+            verdict(seed, "只有正文，没有 header"),
+            Verdict::Reopen,
+            "改动过 → 带着用户上次保存的原文重开"
+        );
+        assert_eq!(
+            verdict("只有正文，没有 header", "只有正文，没有 header"),
+            Verdict::Cancel,
+            "重开后又没改动 = 放弃"
+        );
+        assert_eq!(verdict("只有正文", "fix: 补上了"), Verdict::Accept);
     }
 
     #[test]

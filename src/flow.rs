@@ -123,7 +123,8 @@ pub fn commit() -> ExitCode {
 }
 
 /// 种子写进 git 自己的消息草稿文件（ADR-0001），用 `git var GIT_EDITOR` 指到的编辑器补 subject；
-/// 不合格（描述为空）就带着用户上次保存的原文重开编辑器，循环到通过或编辑器非 0 退出。
+/// 不合格的回环有界（#16 修订 #4 的「空则重开」）：消息与上一轮逐字相同 = 用户没打算写 → 放弃，
+/// 改动过才带着原文重开。
 fn edit_until_acceptable(ty: CommitType, scope: &str, breaking: bool) -> ExitCode {
     let path = match message_path() {
         Ok(path) => path,
@@ -137,14 +138,29 @@ fn edit_until_acceptable(ty: CommitType, scope: &str, breaking: bool) -> ExitCod
         Ok(editor) => editor,
         Err(code) => return code,
     };
+    // 基线用同一个尺子量：种子经 `git stripspace --strip-comments` 后长什么样
+    let mut previous = match stripped_message(&path) {
+        Ok(message) => message,
+        Err(code) => return code,
+    };
     loop {
         if let Err(code) = open_editor(&editor, &path) {
             return code;
         }
-        match stripped_message(&path) {
-            Ok(message) if commit::is_acceptable(&message) => return git_commit(&path),
-            Ok(_) => continue,
+        let message = match stripped_message(&path) {
+            Ok(message) => message,
             Err(code) => return code,
+        };
+        match commit::verdict(&previous, &message) {
+            commit::Verdict::Accept => return git_commit(&path),
+            commit::Verdict::Cancel => {
+                eprintln!("已取消：提交消息未改动，未提交。");
+                return ExitCode::from(EXIT_RUNTIME);
+            }
+            commit::Verdict::Reopen => {
+                previous = message;
+                eprintln!("提示：描述不能为空，已重新打开编辑器；未改动直接退出即放弃提交。");
+            }
         }
     }
 }
