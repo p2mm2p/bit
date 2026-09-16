@@ -5,4 +5,5 @@
 //! [命令面 · 帮助、错误与文案语言](https://github.com/p2mm2p/bit/issues/8)，
 //! 决策依据见 [ADR-0003](../../docs/adr/0003-bit-owns-its-command-surface.md)。
 
+pub mod branch;
 pub mod cli;

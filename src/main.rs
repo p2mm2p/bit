@@ -1,5 +1,7 @@
 //! 解析与调度：所有判断都在 `bit::cli` 里做完，这里只管把结果播出去、把交互流程接上。
 
+mod flow;
+
 use std::process::ExitCode;
 
 use bit::cli::{self, Command, Outcome};
@@ -28,7 +30,7 @@ fn run(command: Command) -> ExitCode {
         return ExitCode::from(cli::EXIT_RUNTIME);
     }
     match command {
-        Command::Branch => not_implemented(command, "#11"),
+        Command::Branch => flow::branch(),
         Command::Commit => not_implemented(command, "#12"),
     }
 }
