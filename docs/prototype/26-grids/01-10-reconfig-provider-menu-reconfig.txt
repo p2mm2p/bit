@@ -1,0 +1,12 @@
+当前配置：DeepSeek / deepseek-v4-pro
+? 提供商  
+> DeepSeek｜国内直连
+  Kimi（Moonshot）｜国内直连        
+  智谱 GLM｜国内直连
+  通义千问｜国内直连
+  OpenAI｜官方 API
+  OpenRouter｜多模型聚合
+  SiliconFlow｜国内直连
+  Ollama（本地）｜本机运行，免密钥  
+  自定义 OpenAI 兼容｜手输 base_url 
+[输入可筛选，回车确认]

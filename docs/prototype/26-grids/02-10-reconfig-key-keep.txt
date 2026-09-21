@@ -1,0 +1,4 @@
+当前配置：DeepSeek / deepseek-v4-pro
+> 提供商 DeepSeek｜国内直连
+? API Key
+[已配置（sk-…0xyz），留空保持不变]

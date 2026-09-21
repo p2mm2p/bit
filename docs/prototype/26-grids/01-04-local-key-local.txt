@@ -1,0 +1,3 @@
+> 提供商 Ollama（本地）｜本机运行，免密钥
+? API Key
+[本地 Ollama 无需密钥，直接回车（写入占位值 ollama）]

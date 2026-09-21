@@ -1,0 +1,9 @@
+> 提供商 DeepSeek｜国内直连
+> API Key ********
+正在获取模型列表…
+> 模型 deepseek-chat
+正在验证连通性…
+已保存 AI 供给：DeepSeek / deepseek-chat
+端点：https://api.deepseek.com
+配置文件：C:\Users\Lenovo\AppData\Roaming\bit\config.toml
+[原型] 未联网、未写文件；上面三行按真实形态打印。        

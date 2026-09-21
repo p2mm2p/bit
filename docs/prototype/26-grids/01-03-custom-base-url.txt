@@ -1,0 +1,3 @@
+> 提供商 自定义 OpenAI 兼容｜手输 base_url
+? base_url https://…/v1
+[OpenAI 兼容端点，含 /v1 之类的版本段]

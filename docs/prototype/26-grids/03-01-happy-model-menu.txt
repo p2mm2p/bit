@@ -1,0 +1,9 @@
+> 提供商 DeepSeek｜国内直连
+> API Key ********
+正在获取模型列表…
+? 模型
+> deepseek-chat       
+  deepseek-reasoner   
+  deepseek-v4-pro     
+  手动输入模型名…     
+[输入可筛选，回车确认]

@@ -1,0 +1,11 @@
+? 提供商  
+> DeepSeek
+  Kimi（Moonshot）    
+  智谱 GLM
+  通义千问
+  OpenAI
+  OpenRouter
+  SiliconFlow
+  Ollama（本地）      
+  自定义 OpenAI 兼容  
+[输入可筛选，回车确认]

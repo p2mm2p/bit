@@ -1,0 +1,7 @@
+> 提供商 DeepSeek｜国内直连
+> API Key ********
+正在获取模型列表…
+> 模型 deepseek-chat
+正在验证连通性…
+错误：连不上 https://api.deepseek.com（无法建立连接）。
+检查网络或代理设置，稍后重跑 bit login。

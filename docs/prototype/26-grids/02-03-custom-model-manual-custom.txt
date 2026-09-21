@@ -1,0 +1,6 @@
+> 提供商 自定义 OpenAI 兼容｜手输 base_url
+> base_url https://api.example.com/v1
+> API Key ********
+正在获取模型列表…
+? 模型 模型名
+[未能获取模型列表，请手动输入模型名（咨询你的提供商）]
