@@ -18,6 +18,8 @@ fn usage_failures_are_two_and_go_to_stderr() {
         &["add", "."][..],
         &["branch", "foo"][..],
         &["commit", "-m", "x"][..],
+        &["commit", "--gen", "foo"][..],
+        &["commit", "--gen", "-h"][..],
         &["login", "foo"][..],
         &["--help", "foo"][..],
     ] {

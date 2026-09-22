@@ -40,9 +40,14 @@ const COMMIT_HELP: &str = "\
 bit commit
 
 选类型 / scope / breaking → 编辑器补 subject，然后 git commit。
+加 --gen：读暂存 diff 生成消息，确认后提交。
 
 用法：
   bit commit
+  bit commit --gen
+
+选项：
+  --gen    读暂存 diff 生成提交消息（需先配置 AI 供给：bit login）
 
 会调用：
   git commit -F <消息文件> --cleanup=strip";
@@ -58,11 +63,13 @@ bit login
 会写入：
   本机 AI 供给配置（路径与手改说明见 README「AI 配置」）";
 
-/// v0.2 的三个子命令。
+/// v0.2 的命令面入口：三个子命令，`bit commit` 另有 `--gen` 一种拼法（#27）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Branch,
     Commit,
+    /// `bit commit --gen`：读暂存 diff 生成提交消息（#27 文法枚举里独立的一条）。
+    CommitGen,
     Login,
 }
 
@@ -72,15 +79,16 @@ impl Command {
         match self {
             Command::Branch => "bit branch",
             Command::Commit => "bit commit",
+            Command::CommitGen => "bit commit --gen",
             Command::Login => "bit login",
         }
     }
 
-    /// 多余参数时给出的直路（#8 表第 5 行 / #27 的 login 行）。
+    /// 多余参数时给出的直路（#8 表第 5 行 / #27 的 login 与 `--gen` 行）。
     pub fn direct_hint(self) -> &'static str {
         match self {
             Command::Branch => "要直接建分支请用 git switch -c <名字>。",
-            Command::Commit => "要直接提交请用 git commit。",
+            Command::Commit | Command::CommitGen => "要直接提交请用 git commit。",
             Command::Login => "要配置 AI 供给请直接运行 bit login。",
         }
     }
@@ -146,9 +154,21 @@ pub fn parse(args: &[String]) -> Outcome {
         "-h" | "--help" => flag(Outcome::Help, rest),
         "-V" | "--version" => flag(Outcome::Version, rest),
         "branch" => command(Command::Branch, rest),
-        "commit" => command(Command::Commit, rest),
+        "commit" => commit_args(rest),
         "login" => command(Command::Login, rest),
         other => Outcome::Usage(UsageError::UnknownCommand(other.to_string())),
+    }
+}
+
+/// `bit commit` 与 `bit commit --gen`：`--gen` 只认紧随 `commit` 的这一种拼法，
+/// 其后只允许无参数（#27 文法枚举）。
+fn commit_args(rest: &[String]) -> Outcome {
+    match rest.first() {
+        Some(first) if first == "--gen" => match rest.get(1) {
+            None => Outcome::Run(Command::CommitGen),
+            Some(extra) => unexpected(Some(Command::CommitGen), extra),
+        },
+        _ => command(Command::Commit, rest),
     }
 }
 
@@ -203,7 +223,8 @@ pub fn help_text() -> String {
 pub fn command_help(command: Command) -> &'static str {
     match command {
         Command::Branch => BRANCH_HELP,
-        Command::Commit => COMMIT_HELP,
+        // `--gen` 没有自己的帮助节：`bit commit --gen -h` 落多余参数出口（#27）。
+        Command::Commit | Command::CommitGen => COMMIT_HELP,
         Command::Login => LOGIN_HELP,
     }
 }
@@ -300,6 +321,10 @@ mod tests {
     fn bare_commands_run_and_help_flags_do_not() {
         assert_eq!(parse_args(&["branch"]), Outcome::Run(Command::Branch));
         assert_eq!(parse_args(&["commit"]), Outcome::Run(Command::Commit));
+        assert_eq!(
+            parse_args(&["commit", "--gen"]),
+            Outcome::Run(Command::CommitGen)
+        );
         assert_eq!(parse_args(&["login"]), Outcome::Run(Command::Login));
         assert_eq!(
             parse_args(&["branch", "-h"]),
@@ -316,6 +341,41 @@ mod tests {
         assert!(command_help(Command::Branch).contains("git switch -c <名字>"));
         assert!(command_help(Command::Commit).contains("git commit -F <消息文件> --cleanup=strip"));
         assert!(command_help(Command::Login).contains("本机 AI 供给配置"));
+    }
+
+    #[test]
+    fn commit_help_matches_the_v0_2_table() {
+        assert_eq!(
+            command_help(Command::Commit),
+            "bit commit\n\n选类型 / scope / breaking → 编辑器补 subject，然后 git commit。\n加 --gen：读暂存 diff 生成消息，确认后提交。\n\n用法：\n  bit commit\n  bit commit --gen\n\n选项：\n  --gen    读暂存 diff 生成提交消息（需先配置 AI 供给：bit login）\n\n会调用：\n  git commit -F <消息文件> --cleanup=strip"
+        );
+    }
+
+    #[test]
+    fn gen_extra_arguments_point_at_git() {
+        assert_eq!(
+            usage_text(parse_args(&["commit", "--gen", "-h"])),
+            "错误：bit commit --gen 不接受参数（`-h`）\n要直接提交请用 git commit。"
+        );
+        assert_eq!(
+            usage_text(parse_args(&["commit", "--gen", "foo"])),
+            "错误：bit commit --gen 不接受参数（`foo`）\n要直接提交请用 git commit。"
+        );
+        assert_eq!(
+            parse_args(&["commit", "--gen", "--"]),
+            Outcome::Usage(UsageError::UnexpectedArg {
+                command: Some(Command::CommitGen),
+                arg: "--".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_args(&["commit", "-h", "--gen"]),
+            Outcome::Usage(UsageError::UnexpectedArg {
+                command: Some(Command::Commit),
+                arg: "--gen".to_string(),
+            }),
+            "`-h` 之后 `--gen` 不再生效"
+        );
     }
 
     #[test]

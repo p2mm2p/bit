@@ -15,6 +15,10 @@
 //! 纯数据与文案在 `bit::login`，供给客户端在 `bit::ai`，写盘在 `bit::config`。
 //! `bit branch` 在 v0.2 接到「描述翻译」：名称输入定案后含非 ASCII 即走一次 chat 调用，
 //! 触发、清理与逐字文案在 `bit::branch`（#23 / #27 的 B4、B6、B10、B12–B19）。
+//! `bit commit --gen` 的阶段顺序、diff 口径、字符预算与两段式、字段复核冻结在
+//! [行为 · 提交消息生成细则](https://github.com/p2mm2p/bit/issues/24)，
+//! 文案逐字取自 [命令面 · v0.2 增补](https://github.com/p2mm2p/bit/issues/27) 的 C1–C17；
+//! 纯函数在 `bit::generation`，供给调用与 git 调用在这里接线。
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -25,6 +29,7 @@ use bit::branch::{self, BranchType};
 use bit::cli::EXIT_RUNTIME;
 use bit::commit::{self, CommitType};
 use bit::config::{self, AiConfig};
+use bit::generation;
 use bit::login::{self, Provider};
 use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text};
@@ -455,6 +460,286 @@ fn git_commit(path: &Path) -> ExitCode {
         Err(error) => {
             eprintln!("错误：无法运行 git（{error}）。");
             ExitCode::from(EXIT_RUNTIME)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bit commit --gen
+// ---------------------------------------------------------------------------
+
+/// `bit commit --gen`：暂存预检 → 供给预检 → 读 diff → 生成 → 展示 / 确认 / 编辑器 → 提交
+/// （#24 第 1 节；`--gen` 的解析与帮助在 `bit::cli`）。
+pub fn commit_gen() -> ExitCode {
+    if let Err(code) = ensure_staged() {
+        return code;
+    }
+    let config = match gen_config() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match generate(&config) {
+        Ok(draft) => show_and_commit(&draft),
+        Err(code) => code,
+    }
+}
+
+/// 供给预检（#24 第 1 节）：未配置 / 配置错误都在读 diff 之前报出、退出码 1。
+/// 没配置就不把暂存内容读进内存、不发任何请求。
+fn gen_config() -> Result<AiConfig, ExitCode> {
+    match load_supply(&config::Env::from_process()) {
+        AiSupply::Ready(config) => Ok(config),
+        AiSupply::Missing => {
+            eprintln!("{}", generation::MISSING_CONFIG);
+            Err(ExitCode::from(EXIT_RUNTIME))
+        }
+        AiSupply::Broken { reason, path } => {
+            eprintln!("{}", generation::config_error(&reason, path.as_deref()));
+            Err(ExitCode::from(EXIT_RUNTIME))
+        }
+    }
+}
+
+/// 读暂存 diff → 过滤 / 预算 → 生成 draft（#24 第 2–5、7、8 节）。
+/// 不超预算时走一次带 `:(exclude)` 的完整 diff；只有两段式才逐文件读。
+fn generate(config: &AiConfig) -> Result<generation::Draft, ExitCode> {
+    let raw = git_capture(&["diff", "--cached", "--numstat", "-z"])?;
+    let files = generation::parse_numstat(&raw);
+    let stat = generation::stat_block(&files);
+    let branch = current_branch()?;
+
+    let all = read_content(&files)?;
+    if all.chars().count() <= generation::CHAR_BUDGET {
+        eprintln!("{}", generation::PROGRESS);
+        let input = generation::generation_input(branch.as_deref(), &stat, &all);
+        return draft_from_chat(
+            config,
+            &generation::generation_prompt(all.is_empty()),
+            &input,
+        );
+    }
+
+    let contents = read_each_content(&files)?;
+    match generation::plan(contents) {
+        generation::Plan::Single { content } => {
+            eprintln!("{}", generation::PROGRESS);
+            let input = generation::generation_input(branch.as_deref(), &stat, &content);
+            draft_from_chat(config, &generation::generation_prompt(false), &input)
+        }
+        generation::Plan::Split { batches, remaining } => {
+            eprintln!("{}", generation::PROGRESS);
+            let mut summaries = Vec::new();
+            for batch in &batches {
+                let input = generation::summary_input(&stat, batch);
+                let output = match gen_chat(config, generation::SUMMARY_PROMPT, &input) {
+                    Ok(output) => output,
+                    Err(_) => return Err(summary_failed()),
+                };
+                match generation::parse_summaries(&output, batch) {
+                    Some(parsed) => summaries.extend(parsed),
+                    None => return Err(summary_failed()),
+                }
+            }
+            let input = generation::final_input(branch.as_deref(), &stat, &summaries, &remaining);
+            draft_from_chat(config, &generation::generation_prompt(false), &input)
+        }
+        generation::Plan::TooBig => {
+            eprintln!("{}", generation::TOO_LARGE);
+            Err(ExitCode::from(EXIT_RUNTIME))
+        }
+    }
+}
+
+/// 分段摘要失败（#27 的 C16）：任一摘要调用或其响应不可用，整体失败、不降级。
+fn summary_failed() -> ExitCode {
+    eprintln!("{}", generation::SUMMARY_FAILED);
+    ExitCode::from(EXIT_RUNTIME)
+}
+
+/// 一次生成调用 + draft 解析（#24 第 5 节）：失败按冻结文案渲染、退出码 1。
+fn draft_from_chat(
+    config: &AiConfig,
+    system: &str,
+    input: &str,
+) -> Result<generation::Draft, ExitCode> {
+    match gen_chat(config, system, input) {
+        Ok(output) => match generation::parse_draft(&output) {
+            Some(draft) => Ok(draft),
+            None => {
+                eprintln!("{}", generation::INVALID_RESPONSE);
+                Err(ExitCode::from(EXIT_RUNTIME))
+            }
+        },
+        Err(error) => {
+            eprintln!(
+                "{}",
+                generation::generation_failure(error.kind(), error.status(), &config.base_url)
+            );
+            Err(ExitCode::from(EXIT_RUNTIME))
+        }
+    }
+}
+
+/// 一次非流式 chat：`json_object` 按供给的静态能力表带（#24 第 5 节），不自动重试。
+fn gen_chat(config: &AiConfig, system: &str, input: &str) -> Result<String, ai::Error> {
+    let client = ai::Client::new(&config.base_url, &config.api_key);
+    let mut request = ai::ChatRequest::new(
+        &config.model,
+        vec![ai::Message::system(system), ai::Message::user(input)],
+    );
+    if ai::supports_json_object(&config.provider) {
+        request = request.json_object();
+    }
+    client.chat(request)
+}
+
+/// 内容面：一次 `git diff --cached`，过滤文件以 `:(exclude)` 排除（#24 第 2 节）；
+/// 重命名要把新旧两个路径都排除，否则旧路径会以删除形态漏进来。
+fn read_content(files: &[generation::FileChange]) -> Result<String, ExitCode> {
+    if files.iter().all(|file| file.filter.is_some()) {
+        return Ok(String::new());
+    }
+    let mut args = diff_content_args();
+    for file in files {
+        if file.filter.is_some() {
+            args.push(format!(":(exclude){}", file.path));
+            if let Some(old) = &file.old_path {
+                args.push(format!(":(exclude){old}"));
+            }
+        }
+    }
+    git_capture(&owned_args(&args))
+}
+
+/// 两段式读取：单文件 `git diff --cached ... -- <路径>`（#24 第 2 节），
+/// 重命名传新旧两个路径，保持 git 的识别结果、不拆成删除 + 添加。
+fn read_each_content(
+    files: &[generation::FileChange],
+) -> Result<Vec<generation::Content>, ExitCode> {
+    let mut contents = Vec::new();
+    for file in files.iter().filter(|file| file.filter.is_none()) {
+        let mut args = diff_content_args();
+        args.push("--".to_string());
+        args.push(file.path.clone());
+        if let Some(old) = &file.old_path {
+            args.push(old.clone());
+        }
+        contents.push(generation::Content {
+            path: file.path.clone(),
+            diff: git_capture(&owned_args(&args))?,
+        });
+    }
+    Ok(contents)
+}
+
+/// 内容面共用的 diff 参数（#24 第 2 节）：上下文 3 行，不吃外部 diff 驱动与 textconv。
+fn diff_content_args() -> Vec<String> {
+    [
+        "diff",
+        "--cached",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--unified=3",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect()
+}
+
+/// 把拥有的参数借给 [`git_capture`]。
+fn owned_args(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// 生成上下文只带当前分支名（#24 第 7 节）；detached（空输出）即省略。
+fn current_branch() -> Result<Option<String>, ExitCode> {
+    let name = git_capture(&["branch", "--show-current"])?;
+    let name = name.trim();
+    Ok((!name.is_empty()).then(|| name.to_string()))
+}
+
+/// draft 的展示 / 确认 / 编辑器（#24 第 6 节、#27 的 C2–C7）：
+/// 字段全合格才开确认门；异常或选「否」都进编辑器，编辑器定案后再复核一次。
+fn show_and_commit(draft: &generation::Draft) -> ExitCode {
+    let message = draft.message();
+    show_draft(&message);
+    if draft.issues.is_empty() {
+        match Confirm::new(generation::CONFIRM)
+            .with_default(true)
+            .prompt_skippable()
+        {
+            Ok(Some(true)) => commit_message(&message),
+            Ok(Some(false)) => edit_until_reviewed(&message),
+            Ok(None) => cancelled(),
+            Err(error) => inquire_failed(error),
+        }
+    } else {
+        for issue in &draft.issues {
+            eprintln!("{}", issue.note());
+        }
+        edit_until_reviewed(&message)
+    }
+}
+
+/// C2：draft 原样打印到 stderr，首行加粗（ANSI）。
+fn show_draft(message: &str) {
+    let mut lines = message.lines();
+    eprintln!("\x1b[1m{}\x1b[0m", lines.next().unwrap_or_default());
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
+/// 确认「是」：draft 写进 `COMMIT_EDITMSG`，`git commit -F` 的语义原样透传（#24 第 6 节）。
+fn commit_message(message: &str) -> ExitCode {
+    let path = match message_path() {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    if let Err(error) = fs::write(&path, format!("{message}\n")) {
+        eprintln!("错误：无法写入消息文件（{error}）。");
+        return ExitCode::from(EXIT_RUNTIME);
+    }
+    git_commit(&path)
+}
+
+/// 编辑器回环（#24 第 6 节）：预填 draft；与上一轮逐字相同即「未改动退出」；
+/// 改动过再由 [`generation::review`] 做与菜单等价的复核（type ∈ 11、scope 合法、subject 非空），
+/// 不过则带原文重开。
+fn edit_until_reviewed(message: &str) -> ExitCode {
+    let path = match message_path() {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    if let Err(error) = fs::write(&path, generation::editor_seed(message)) {
+        eprintln!("错误：无法写入消息文件（{error}）。");
+        return ExitCode::from(EXIT_RUNTIME);
+    }
+    let editor = match git_editor() {
+        Ok(editor) => editor,
+        Err(code) => return code,
+    };
+    let mut previous = match stripped_message(&path) {
+        Ok(message) => message,
+        Err(code) => return code,
+    };
+    loop {
+        if let Err(code) = open_editor(&editor, &path) {
+            return code;
+        }
+        let message = match stripped_message(&path) {
+            Ok(message) => message,
+            Err(code) => return code,
+        };
+        if message == previous {
+            eprintln!("{}", generation::CANCELED_UNCHANGED);
+            return ExitCode::from(EXIT_RUNTIME);
+        }
+        previous = message.clone();
+        match generation::review(&message) {
+            Ok(()) => return git_commit(&path),
+            Err(reason) => eprintln!("{}", generation::review_failed(&reason)),
         }
     }
 }
