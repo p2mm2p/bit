@@ -671,6 +671,14 @@ pub fn models_body(ids: &[&str]) -> String {
     format!(r#"{{"data":[{}]}}"#, entries.join(","))
 }
 
+/// `POST /chat/completions` 的成功体，content 由用例定（译文成功 / 非法译文）。
+pub fn chat_body(content: &str) -> String {
+    serde_json::json!({
+        "choices": [{"message": {"role": "assistant", "content": content}}]
+    })
+    .to_string()
+}
+
 /// `POST /chat/completions` 的成功体（验证只要求信封可用）。
 pub const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
 

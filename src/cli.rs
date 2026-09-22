@@ -28,6 +28,7 @@ const BRANCH_HELP: &str = "\
 bit branch
 
 选类型 → 输名字 → 确认，然后 git switch -c。
+配置 AI 供给后，描述可直接写中文（自动翻译为英文）。
 
 用法：
   bit branch
@@ -315,6 +316,14 @@ mod tests {
         assert!(command_help(Command::Branch).contains("git switch -c <名字>"));
         assert!(command_help(Command::Commit).contains("git commit -F <消息文件> --cleanup=strip"));
         assert!(command_help(Command::Login).contains("本机 AI 供给配置"));
+    }
+
+    #[test]
+    fn branch_help_matches_the_v0_2_table() {
+        assert_eq!(
+            command_help(Command::Branch),
+            "bit branch\n\n选类型 → 输名字 → 确认，然后 git switch -c。\n配置 AI 供给后，描述可直接写中文（自动翻译为英文）。\n\n用法：\n  bit branch\n\n会调用：\n  git switch -c <名字>"
+        );
     }
 
     #[test]

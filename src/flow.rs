@@ -13,6 +13,8 @@
 //! [原型 · bit login 向导交互与文案](https://github.com/p2mm2p/bit/issues/26) 与
 //! [命令面 · v0.2 增补](https://github.com/p2mm2p/bit/issues/27) 的登录节，
 //! 纯数据与文案在 `bit::login`，供给客户端在 `bit::ai`，写盘在 `bit::config`。
+//! `bit branch` 在 v0.2 接到「描述翻译」：名称输入定案后含非 ASCII 即走一次 chat 调用，
+//! 触发、清理与逐字文案在 `bit::branch`（#23 / #27 的 B4、B6、B10、B12–B19）。
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -28,7 +30,11 @@ use inquire::validator::Validation;
 use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text};
 
 /// `bit branch`：选类型 → 输名字 → 确认 → `git switch -c`。
+/// v0.2：AI 供给可用时，名称输入里的非 ASCII 先走一次描述翻译，再回到既有管线（#23）。
 pub fn branch() -> ExitCode {
+    let supply = load_supply(&config::Env::from_process());
+    let ai_configured = supply.accepts_translation();
+
     let selected = match Select::new("分支类型", BranchType::ALL.to_vec())
         .with_page_size(BranchType::ALL.len())
         .prompt_skippable()
@@ -42,31 +48,158 @@ pub fn branch() -> ExitCode {
     loop {
         let raw = match Text::new("分支描述")
             .with_placeholder("add-oauth-login")
-            .with_help_message("描述性短语，2–5 个词、约 ≤50 字符（软建议）")
+            .with_help_message(branch::description_help(ai_configured))
             .with_initial_value(&raw_input)
-            .with_validator(move |input: &str| match branch::resolve(input, selected) {
-                Ok(_) => Ok(Validation::Valid),
-                Err(error) => Ok(Validation::Invalid(error.message().into())),
-            })
+            .with_validator(move |input: &str| Ok(branch_validator(input, selected, ai_configured)))
             .prompt_skippable()
         {
             Ok(Some(raw)) => raw,
             Ok(None) => return cancelled(),
             Err(error) => return inquire_failed(error),
         };
-        let resolved = branch::resolve(&raw, selected).expect("validator 用的就是这个函数");
+
+        // 翻译失败已渲染 B13–B19：回名称输入、预填原文，不自动重试（#23）。
+        let Some(resolved) = finalize(&supply, selected, &raw) else {
+            raw_input = raw;
+            continue;
+        };
 
         let message = format!("将创建并切换到 {}，确认？", resolved.name);
-        let normalized_note = format!("由 \"{raw}\" 规范化");
+        // note 得先于 confirm 声明：inquire 的 help 借用要活到 prompt 结束。
+        let note = branch::confirmation_note(&raw, &resolved);
         let mut confirm = Confirm::new(&message).with_default(true);
-        if resolved.changed {
-            confirm = confirm.with_help_message(&normalized_note);
+        if let Some(note) = &note {
+            confirm = confirm.with_help_message(note);
         }
         match confirm.prompt_skippable() {
             Ok(Some(true)) => return switch(&resolved.name),
             Ok(Some(false)) => raw_input = raw,
             Ok(None) => return cancelled(),
             Err(error) => return inquire_failed(error),
+        }
+    }
+}
+
+/// `bit branch` 眼里的 AI 供给三态（#25 的 `Config`）。
+enum AiSupply {
+    /// 未配置：AI 能力不存在，名称输入与 v0.1 逐字相同。
+    Missing,
+    /// 可用：非 ASCII 触发描述翻译。
+    Ready(AiConfig),
+    /// 配置错误：按「已配置」对待（help / 放行），真触发翻译时以 B19 收场。
+    Broken {
+        reason: String,
+        path: Option<PathBuf>,
+    },
+}
+
+impl AiSupply {
+    /// 名称输入是否按「已配置」对待：非 ASCII 放行、help 用 B4。
+    fn accepts_translation(&self) -> bool {
+        !matches!(self, AiSupply::Missing)
+    }
+}
+
+/// 惰性读一次配置（#25）：只分类、不提前失败——纯 ASCII 的 `bit branch` 零回归。
+fn load_supply(env: &config::Env) -> AiSupply {
+    match config::load_from(env) {
+        config::Config::Missing => AiSupply::Missing,
+        config::Config::Ready(config) => AiSupply::Ready(config),
+        config::Config::Invalid { reason, path } => AiSupply::Broken { reason, path },
+    }
+}
+
+/// 名称输入的 validator（#23 / #27 的 B5–B6）：配置可用时放行「非 ASCII 导致的
+/// `IllegalChar`」交给翻译；未配置时对同一情形追加 `bit login` 的指路句。
+fn branch_validator(input: &str, selected: BranchType, ai_configured: bool) -> Validation {
+    match branch::resolve(input, selected) {
+        Ok(_) => Validation::Valid,
+        Err(_) if branch::is_translatable(input, selected) => {
+            if ai_configured {
+                Validation::Valid
+            } else {
+                Validation::Invalid(branch::ILLEGAL_CHAR_AI_HINT.into())
+            }
+        }
+        Err(error) => Validation::Invalid(error.message().into()),
+    }
+}
+
+/// 输入定案 → 结果（#23）：纯 ASCII 走 v0.1 的 `resolve`；含非 ASCII 且 AI 可用走翻译。
+/// 翻译失败已渲染（B13–B19）时给 `None`，调用方回名称输入并预填原文。
+fn finalize(supply: &AiSupply, selected: BranchType, raw: &str) -> Option<branch::Resolved> {
+    let description = branch::description_of(raw, selected).expect("validator 用的就是这个函数");
+    if !branch::needs_translation(&description) {
+        return Some(branch::resolve(raw, selected).expect("validator 用的就是这个函数"));
+    }
+    match supply {
+        AiSupply::Ready(config) => translate_branch(config, selected, raw, &description),
+        AiSupply::Broken { reason, path } => {
+            eprintln!(
+                "{}",
+                branch::translation_config_error(reason, path.as_deref())
+            );
+            None
+        }
+        // validator 在未配置时拒收非 ASCII；走到这里只可能是代码缺陷，防御性 panic 比静默强。
+        AiSupply::Missing => unreachable!("validator 在未配置时拒收非 ASCII"),
+    }
+}
+
+/// 一次描述翻译（#23 / #27）：B12 进度 → `chat` → 译文清理；失败渲染后给 `None`。
+fn translate_branch(
+    config: &AiConfig,
+    selected: BranchType,
+    raw: &str,
+    description: &str,
+) -> Option<branch::Resolved> {
+    eprintln!("{}", branch::TRANSLATION_PROGRESS);
+    let client = ai::Client::new(&config.base_url, &config.api_key);
+    let request = ai::ChatRequest::new(
+        &config.model,
+        vec![
+            ai::Message::system(branch::TRANSLATION_PROMPT),
+            ai::Message::user(&branch::translation_input(selected, description)),
+        ],
+    )
+    .temperature(0.0);
+    match client.chat(request) {
+        Ok(output) => match branch::resolve_translation(selected, raw, &output) {
+            Some(resolved) => Some(resolved),
+            None => {
+                eprintln!("{}", branch::TRANSLATION_UNAVAILABLE);
+                None
+            }
+        },
+        Err(error) => {
+            match error.kind() {
+                ai::Kind::Auth => {
+                    eprintln!(
+                        "{}",
+                        branch::translation_auth_failed(error.status().unwrap_or(401))
+                    );
+                }
+                ai::Kind::RateLimited => eprintln!("{}", branch::TRANSLATION_RATE_LIMITED),
+                ai::Kind::Network => {
+                    eprintln!("{}", branch::translation_network_error(&config.base_url));
+                }
+                ai::Kind::Server => {
+                    eprintln!(
+                        "{}",
+                        branch::translation_server_error(error.status().unwrap_or(500))
+                    );
+                }
+                ai::Kind::ModelOrRequest => {
+                    eprintln!(
+                        "{}",
+                        branch::translation_model_error(error.status().unwrap_or(400))
+                    );
+                }
+                // 2xx 但信封不可解析：#23 的七类未列，按 #30 对 `InvalidResponse` 的先例
+                // 归「译文不可用」。
+                ai::Kind::InvalidResponse => eprintln!("{}", branch::TRANSLATION_UNAVAILABLE),
+            }
+            None
         }
     }
 }
