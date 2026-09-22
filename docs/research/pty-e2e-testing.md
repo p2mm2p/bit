@@ -235,3 +235,35 @@ let (row, col) = screen.cursor_position();      // 光标位置也可断言
    单加**——conpty 只拼显式 set 过的变量，那样会把 `PATH` 一起丢掉（#13 评论的第 2 条坑）；
    夹具是 `env_clear()` 后整份搬当前环境、再覆盖要隔离的那几个。
 
+---
+
+## 7. v0.2 增补：AI 供给 stub 与无配置回归（2026-09-22，随 [实现 · 测试与 CI 增补（stub 供给）](https://github.com/p2mm2p/bit/issues/33) 落地）
+
+v0.2 把 AI 供给接进 `branch` / `commit --gen` / `login` 之后，测试面多了一层网络：
+用例要能走真 HTTP 链路，又绝不能碰真 API。做法是在 §6 的夹具体系上加一个本地供给 stub；
+本节只记增量，不重复 §1–§6。
+
+1. **供给 stub（`AiStub`，`tests/common/mod.rs`）**：`TcpListener` 绑 `127.0.0.1:0`，
+   对每条请求按用例闭包应答（`AiReply::ok` / `AiReply::status`），覆盖 `GET /models` 与
+   `POST /chat/completions`，`models_body` / `chat_body` 拼响应体。这是**真 HTTP**
+   （一路走到底层的 ureq），但不是真 API：loopback、无外网、不需要 key，CI 不需要任何 secret。
+   网络失败用例用 `dead_base_url()`——借一个刚释放的空闲端口，保证连不上。
+2. **配置与代理同样隔离进夹具**：`BIT_CONFIG` 钉到临时目录、`BIT_AI_*` 一律 `env_remove`、
+   `HOME` / `USERPROFILE` / `XDG_CONFIG_HOME` 改道、`NO_PROXY` 覆盖 loopback——
+   开发机上的真配置、真 key 与代理环境都渗不进用例（ureq 默认读代理环境变量，见 #22 的调研）。
+3. **三个新路径的 e2e**：`e2e_login.rs` 7 条（正向写盘、Esc 取消、401 回 key、404 回模型、
+   网络失败退出 1、重配保 key、坏配置不改写）；`e2e_branch_translation.rs` 7 条
+   （翻译成功、401 回填原文、译文不可用、网络失败、坏配置在翻译期报出、坏配置下 ASCII 照常、
+   无配置拒中文）；`e2e_commit_gen.rs` 9 条（确认即提交、确认「否」走编辑器、编辑器未改动放弃、
+   未知 type 跳过确认、401、超预算两段式、全过滤仍生成、复核失败回环、无配置拦在读 diff 前）。
+   `src/ai.rs` 另有 16 条离线单测（手写 loopback stub），与配置 32 条、生成 16 条等合计单测 100 条。
+4. **无配置零回归**：v0.1 的 `e2e_branch.rs`（3 条）与 `e2e_commit.rs`（5 条）都跑在
+   「没有 AI 配置」的夹具里（`BIT_CONFIG` 指向不存在的文件，就是没跑过 `bit login` 的场景），
+   其中两条专钉配置错误的惰性：坏配置不碰 `bit commit` 交互路径、纯 ASCII 的 `bit branch`
+   照常建分支（`load_supply` 只分类、不提前失败，见 #25）；另有专测「无配置时中文被 validator
+   当场拒、help 仍是 v0.1 的 B3、无分支落盘」。
+5. **退出码面**：用法 2（`command_surface.rs`）、运行期 1（`e2e_non_tty.rs` 与各失败用例）、
+   帮助 / 版本 0、git 自身失败 128 原样透传（`e2e_branch.rs` 重名）——四个数值都有 e2e 级断言。
+6. **CI 不变量**：工作流不变（三平台矩阵跑 fmt / clippy `-D warnings` / `cargo test`），
+   测试里没有 `#[ignore]`、没有读环境开关连真 API 的用例；本地 macOS 全套 135 条
+   （100 unit + 35 e2e）绿，三平台以 push 后的 CI 为准。

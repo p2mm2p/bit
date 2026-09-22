@@ -1,8 +1,13 @@
 //! `bit commit` 的 pty e2e（[测试 · 测试与 CI 策略](https://github.com/p2mm2p/bit/issues/6) 用例 2、5、6，
 //! 另加用例 7）：用例 6 的空 subject 回环语义由
 //! [修订 · bit commit 空描述回环](https://github.com/p2mm2p/bit/issues/16) 改写为「未改动即放弃」。
+//!
+//! 夹具默认不写 AI 配置：本文件同时是「无配置零回归」的 e2e 面
+//! （[实现 · 测试与 CI 增补（stub 供给）](https://github.com/p2mm2p/bit/issues/33)）。
 
 mod common;
+
+use std::fs;
 
 use bit::commit::{self, CommitType};
 use common::{Fixture, Pty};
@@ -94,6 +99,41 @@ fn quitting_the_editor_untouched_abandons_the_commit() {
         pty.screen().contains("已取消：提交消息未改动，未提交。"),
         "取消文案要上屏：\n{}",
         pty.screen()
+    );
+}
+
+/// v0.2 惰性读取的回归（#33）：AI 配置坏着也不碰 `bit commit` 交互路径——不读它、不改它。
+#[test]
+fn broken_ai_config_does_not_touch_the_plain_commit_path() {
+    if common::ensure_console("broken_ai_config_does_not_touch_the_plain_commit_path") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let broken = "provider = \"nope\"\n";
+    fixture.write_config(broken);
+    let before = fixture.commit_count();
+    fixture.stage("docs/note.md", "e2e 夹具的暂存内容\n");
+    fixture.editor_mode("write");
+    fixture.editor_message(&format!("{MESSAGE}\n"));
+
+    let mut pty = Pty::spawn(&fixture, &["commit"]);
+    pty.expect_screen("提交类型");
+    pty.send("\x1b[B"); // feat → fix
+    pty.send("\x1b[B"); // fix → docs
+    pty.send("\r");
+    pty.expect_screen("作用范围（scope）");
+    pty.send("ui");
+    pty.send("\r");
+    pty.expect_screen("是破坏性变更（breaking change）吗？");
+    pty.send("\r"); // 默认否
+
+    assert_eq!(pty.exit_code(), 0);
+    assert_eq!(fixture.commit_count(), before + 1, "v0.1 路径照常提交");
+    assert_eq!(fixture.git_ok(&["log", "-1", "--pretty=%B"]), MESSAGE);
+    assert_eq!(
+        fs::read_to_string(fixture.config_path()).expect("读配置"),
+        broken,
+        "非 AI 路径不该触碰配置文件"
     );
 }
 

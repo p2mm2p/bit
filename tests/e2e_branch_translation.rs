@@ -193,6 +193,38 @@ fn broken_config_is_reported_at_translation_time() {
     );
 }
 
+/// 惰性回归（#33）：配置错误只属于 AI 路径——纯 ASCII 名字不触发翻译，照常建分支、配置不动。
+#[test]
+fn broken_config_still_creates_ascii_named_branch() {
+    if common::ensure_console("broken_config_still_creates_ascii_named_branch") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let broken = "provider = \"nope\"\n";
+    fixture.write_config(broken);
+    let mut pty = Pty::spawn(&fixture, &["branch"]);
+
+    pty.expect_screen("分支类型");
+    pty.send("\r");
+    pty.expect_screen("分支描述");
+    pty.send("add-login");
+    pty.send("\r");
+
+    pty.expect_screen("确认"); // ASCII 不翻译，直接回 v0.1 的确认门
+    pty.send("\r");
+    pty.expect_screen("Switched to a new branch");
+    assert_eq!(pty.exit_code(), 0);
+    assert_eq!(
+        fixture.git_ok(&["branch", "--show-current"]),
+        "feature/add-login"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.config_path()).expect("读配置"),
+        broken,
+        "非 AI 路径不该重写配置"
+    );
+}
+
 /// 无配置零回归：中文仍被 validator 当场拒（B6 指路 bit login）、help 是 B3、无分支落盘。
 #[test]
 fn without_config_non_ascii_is_rejected_like_v0_1() {
