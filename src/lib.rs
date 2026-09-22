@@ -10,3 +10,4 @@ pub mod branch;
 pub mod cli;
 pub mod commit;
 pub mod config;
+pub mod login;

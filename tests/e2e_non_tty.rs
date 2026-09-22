@@ -15,7 +15,7 @@ fn piped_stdio_is_rejected_before_any_interaction() {
     // 有暂存内容也不该提交：预检在 TTY 预检之后，压根走不到
     fixture.stage("docs/note.md", "夹具的暂存内容\n");
 
-    for args in [&["branch"][..], &["commit"][..]] {
+    for args in [&["branch"][..], &["commit"][..], &["login"][..]] {
         let run = fixture.run_bit(args);
         assert_eq!(run.code, i32::from(EXIT_RUNTIME), "bit {args:?} 的退出码");
         assert!(run.stdout.is_empty(), "诊断不该走 stdout：{}", run.stdout);
@@ -25,7 +25,9 @@ fn piped_stdio_is_rejected_before_any_interaction() {
             run.stderr
         );
         assert!(
-            !run.stderr.contains("分支类型") && !run.stderr.contains("提交类型"),
+            !run.stderr.contains("分支类型")
+                && !run.stderr.contains("提交类型")
+                && !run.stderr.contains("提供商"),
             "退出前不该渲染菜单：{}",
             run.stderr
         );

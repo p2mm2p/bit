@@ -8,16 +8,24 @@
 //! `git stripspace --strip-comments`、不合格带着用户上次的原文重开编辑器。
 //! 两侧的 git 调用都把 stdout/stderr 与退出码原样透传。交互界面渲染在 stderr（inquire 的现状），
 //! stdout 只承载 git 的输出（ADR-0003）。
+//!
+//! `bit login` 是自己的一份向导：交互与文案逐字取自
+//! [原型 · bit login 向导交互与文案](https://github.com/p2mm2p/bit/issues/26) 与
+//! [命令面 · v0.2 增补](https://github.com/p2mm2p/bit/issues/27) 的登录节，
+//! 纯数据与文案在 `bit::login`，供给客户端在 `bit::ai`，写盘在 `bit::config`。
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+use bit::ai;
 use bit::branch::{self, BranchType};
 use bit::cli::EXIT_RUNTIME;
 use bit::commit::{self, CommitType};
+use bit::config::{self, AiConfig};
+use bit::login::{self, Provider};
 use inquire::validator::Validation;
-use inquire::{Confirm, InquireError, Select, Text};
+use inquire::{Confirm, InquireError, Password, PasswordDisplayMode, Select, Text};
 
 /// `bit branch`：选类型 → 输名字 → 确认 → `git switch -c`。
 pub fn branch() -> ExitCode {
@@ -336,6 +344,301 @@ fn inquire_failed(error: InquireError) -> ExitCode {
         other => {
             eprintln!("错误：交互界面出错（{other}）。");
             ExitCode::from(EXIT_RUNTIME)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bit login
+// ---------------------------------------------------------------------------
+
+/// 向导内部的收场：Esc、Ctrl-C、或已经渲染过文案的失败。
+enum Stop {
+    /// Esc：stderr 一句中文、退出码 1、不写配置。
+    Cancelled,
+    /// Ctrl-C：退出码 130、无文案。
+    Interrupted,
+    /// 具体文案已经打印过。
+    Failed,
+}
+
+/// `bit login`：先读当前配置（坏配置不静默覆盖）→ 向导 → 验证通过才写盘。
+pub fn login() -> ExitCode {
+    let env = config::Env::from_process();
+    let config_path = match config::path(&env) {
+        Ok(path) => path,
+        Err(reason) => {
+            eprintln!("{}", login::config_unavailable(&reason, None));
+            return ExitCode::from(EXIT_RUNTIME);
+        }
+    };
+    let current = match config::load(&config_path, &env) {
+        config::Config::Missing => None,
+        config::Config::Ready(config) => Some(config),
+        config::Config::Invalid { reason, .. } => {
+            eprintln!("{}", login::config_unavailable(&reason, Some(&config_path)));
+            return ExitCode::from(EXIT_RUNTIME);
+        }
+    };
+    match wizard(&config_path, current.as_ref()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(Stop::Cancelled) => cancelled(),
+        Err(Stop::Interrupted) => ExitCode::from(130),
+        Err(Stop::Failed) => ExitCode::from(EXIT_RUNTIME),
+    }
+}
+
+/// 向导主体（#26 流程）：提供商 → [自定义] base_url → key → 试 /models → 验证。
+fn wizard(config_path: &Path, current: Option<&AiConfig>) -> Result<(), Stop> {
+    if let Some(current) = current {
+        eprintln!(
+            "{}",
+            login::current_config_line(&current.provider, &current.model)
+        );
+    }
+
+    let provider = prompt_provider(current)?;
+    // 重配且没换家：base_url 与 key 都沿当前值（预置端点可能被手改成镜像 / 代理）。
+    let stored = current.filter(|config| config.provider == provider.key);
+    let base_url = if provider.base_url.is_empty() {
+        prompt_base_url(stored.map(|config| config.base_url.as_str()).unwrap_or(""))?
+    } else {
+        stored.map_or_else(
+            || provider.base_url.to_string(),
+            |config| config.base_url.clone(),
+        )
+    };
+    let kept_key = stored.map(|config| config.api_key.as_str());
+    let current_model = stored.map(|config| config.model.as_str());
+
+    'auth: loop {
+        let api_key = prompt_key(provider, kept_key)?;
+        let client = ai::Client::new(&base_url, &api_key);
+        eprintln!("{}", login::MODELS_PROGRESS);
+        // 拉不到模型列表不是错：静默回退手输（#26 流程）。
+        let models = client.list_models().ok();
+        loop {
+            let model = prompt_model(provider, models.as_deref(), current_model)?;
+            eprintln!("{}", login::VERIFY_PROGRESS);
+            match client.verify(&model) {
+                Ok(()) => return save(config_path, provider, &base_url, &model, &api_key),
+                Err(error) => match error.kind() {
+                    ai::Kind::Auth => {
+                        eprintln!("{}", login::auth_failed(error.status().unwrap_or(401)));
+                        // 回 key 输入；模型列表下次重拉。
+                        continue 'auth;
+                    }
+                    ai::Kind::ModelOrRequest => {
+                        eprintln!(
+                            "{}",
+                            login::model_unavailable(error.status().unwrap_or(404), &model)
+                        );
+                        // 回模型输入，复用已拉取的列表。
+                        continue;
+                    }
+                    ai::Kind::RateLimited => {
+                        eprintln!("{}", login::RATE_LIMITED);
+                        return Err(Stop::Failed);
+                    }
+                    ai::Kind::Server => {
+                        eprintln!("{}", login::server_error(error.status().unwrap_or(500)));
+                        return Err(Stop::Failed);
+                    }
+                    ai::Kind::Network => {
+                        eprintln!("{}", login::network_error(&base_url));
+                        return Err(Stop::Failed);
+                    }
+                    ai::Kind::InvalidResponse => {
+                        eprintln!("{}", login::INVALID_RESPONSE);
+                        return Err(Stop::Failed);
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// 验证通过后的收尾：写盘、三行摘要（成功摘要走 stdout，沿原型的形态）。
+fn save(
+    config_path: &Path,
+    provider: &Provider,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+) -> Result<(), Stop> {
+    let chosen = AiConfig {
+        provider: provider.key.to_string(),
+        base_url: base_url.to_string(),
+        model: model.to_string(),
+        api_key: api_key.to_string(),
+    };
+    if let Err(error) = config::write(config_path, &chosen) {
+        eprintln!("{}", login::write_failed(&error, config_path));
+        return Err(Stop::Failed);
+    }
+    println!("{}", login::saved_summary(provider.key, model));
+    println!("{}", login::endpoint_line(base_url));
+    println!("{}", login::config_file_line(config_path));
+    Ok(())
+}
+
+/// 提供商菜单：单层平铺 9 项、`名字｜短说明`（#26 拍板 1）；重配时光标落在当前值。
+fn prompt_provider(current: Option<&AiConfig>) -> Result<&'static Provider, Stop> {
+    let rows: Vec<ProviderRow> = login::PROVIDERS
+        .iter()
+        .map(|provider| ProviderRow { provider })
+        .collect();
+    let cursor = current
+        .and_then(|config| {
+            login::PROVIDERS
+                .iter()
+                .position(|provider| provider.key == config.provider)
+        })
+        .unwrap_or(0);
+    let selected = skippable(
+        Select::new("提供商", rows)
+            .with_page_size(login::PROVIDERS.len())
+            .with_starting_cursor(cursor)
+            .with_help_message(login::MENU_HELP)
+            .prompt_skippable(),
+    )?;
+    Ok(selected.provider)
+}
+
+/// 菜单行的呈现：`名字｜短说明`，同一段文本也参与模糊筛选。
+struct ProviderRow {
+    provider: &'static Provider,
+}
+
+impl std::fmt::Display for ProviderRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}｜{}", self.provider.name, self.provider.hint)
+    }
+}
+
+/// 自定义家的 base_url：重配时预填当前值（#26 拍板 4）。
+fn prompt_base_url(initial: &str) -> Result<String, Stop> {
+    let mut prompt = Text::new("base_url")
+        .with_placeholder("https://…/v1")
+        .with_help_message(login::BASE_URL_HELP)
+        .with_validator(|input: &str| match login::validate_base_url(input) {
+            Ok(()) => Ok(Validation::Valid),
+            Err(message) => Ok(Validation::Invalid(message.into())),
+        });
+    if !initial.is_empty() {
+        prompt = prompt.with_initial_value(initial);
+    }
+    let answer = skippable(prompt.prompt_skippable())?;
+    Ok(answer.trim().to_string())
+}
+
+/// API Key：Masked（星号回显）、不二次确认、不开明文切换（#26 拍板 3）。
+fn prompt_key(provider: &Provider, kept_key: Option<&str>) -> Result<String, Stop> {
+    let local = provider.key == "ollama";
+    let help = if local {
+        Some(login::OLLAMA_KEY_HELP.to_string())
+    } else {
+        kept_key.map(login::key_keep_help)
+    };
+
+    let mut prompt = Password::new("API Key")
+        .with_display_mode(PasswordDisplayMode::Masked)
+        .without_confirmation();
+    if let Some(help) = &help {
+        prompt = prompt.with_help_message(help);
+    }
+    if !local && kept_key.is_none() {
+        prompt = prompt.with_validator(|input: &str| {
+            if input.trim().is_empty() {
+                Ok(Validation::Invalid(login::KEY_EMPTY.into()))
+            } else {
+                Ok(Validation::Valid)
+            }
+        });
+    }
+
+    let answer = skippable(prompt.prompt_skippable())?;
+    let answer = answer.trim();
+    if answer.is_empty() {
+        if local {
+            return Ok(login::OLLAMA_PLACEHOLDER.to_string());
+        }
+        if let Some(key) = kept_key {
+            return Ok(key.to_string());
+        }
+    }
+    Ok(answer.to_string())
+}
+
+/// 模型：列表拿得到就菜单（末项手输），拿不到就静默回退手输（#26 拍板 2、7）。
+fn prompt_model(
+    provider: &Provider,
+    models: Option<&[String]>,
+    current_model: Option<&str>,
+) -> Result<String, Stop> {
+    let Some(models) = models else {
+        return prompt_model_manual(provider);
+    };
+    let cursor = current_model
+        .and_then(|current| models.iter().position(|model| model.as_str() == current))
+        .unwrap_or(0);
+    let mut rows: Vec<ModelRow> = models.iter().cloned().map(ModelRow::Model).collect();
+    rows.push(ModelRow::Manual);
+    let selected = skippable(
+        Select::new("模型", rows)
+            .with_page_size(10)
+            .with_starting_cursor(cursor)
+            .with_help_message(login::MENU_HELP)
+            .prompt_skippable(),
+    )?;
+    match selected {
+        ModelRow::Model(model) => Ok(model),
+        ModelRow::Manual => prompt_model_manual(provider),
+    }
+}
+
+/// 模型菜单的行：列表项与末项「手动输入模型名…」。
+enum ModelRow {
+    Model(String),
+    Manual,
+}
+
+impl std::fmt::Display for ModelRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelRow::Model(model) => f.write_str(model),
+            ModelRow::Manual => f.write_str(login::MODEL_MANUAL_ROW),
+        }
+    }
+}
+
+/// 回退手输：占位符＝建议值（没有则「模型名」），帮助行解释原因（#26 拍板 2）。
+fn prompt_model_manual(provider: &Provider) -> Result<String, Stop> {
+    let answer = skippable(
+        Text::new("模型")
+            .with_placeholder(login::manual_placeholder(provider))
+            .with_help_message(login::manual_help(provider))
+            .with_validator(|input: &str| {
+                if input.trim().is_empty() {
+                    Ok(Validation::Invalid(login::MODEL_EMPTY.into()))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            })
+            .prompt_skippable(),
+    )?;
+    Ok(answer.trim().to_string())
+}
+
+/// Esc → `Cancelled`；Ctrl-C → `Interrupted`；其余交互异常 → 已渲染文案的 `Failed`。
+fn skippable<T>(result: Result<Option<T>, InquireError>) -> Result<T, Stop> {
+    match result {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Err(Stop::Cancelled),
+        Err(InquireError::OperationInterrupted) => Err(Stop::Interrupted),
+        Err(other) => {
+            eprintln!("错误：交互界面出错（{other}）。");
+            Err(Stop::Failed)
         }
     }
 }

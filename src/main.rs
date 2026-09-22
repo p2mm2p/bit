@@ -32,6 +32,7 @@ fn run(command: Command) -> ExitCode {
     match command {
         Command::Branch => flow::branch(),
         Command::Commit => flow::commit(),
+        Command::Login => flow::login(),
     }
 }
 

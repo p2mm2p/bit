@@ -1,8 +1,10 @@
 //! 命令面：手写参数解析、帮助正文、诊断文案与退出码。
 //!
-//! 文案模板冻结在 [命令面 · 帮助、错误与文案语言](https://github.com/p2mm2p/bit/issues/8)，
-//! 实现直接抄；三层退出码的语义见 [ADR-0003](../../docs/adr/0003-bit-owns-its-command-surface.md)。
-//! 未被 #8 枚举的输入（`--`、组合短选项、任何多余位置参数）不逐条特判，统一落进用法错误出口。
+//! v0.1 文案冻结在 [命令面 · 帮助、错误与文案语言](https://github.com/p2mm2p/bit/issues/8)；
+//! v0.2 增补（`bit login` 与三命令版公共文案）冻结在
+//! [命令面 · v0.2 增补](https://github.com/p2mm2p/bit/issues/27)，实现直接抄；
+//! 三层退出码的语义见 [ADR-0003](../../docs/adr/0003-bit-owns-its-command-surface.md)。
+//! 未被冻结表枚举的输入（`--`、组合短选项、任何多余位置参数）不逐条特判，统一落进用法错误出口。
 
 use std::io::IsTerminal;
 
@@ -15,12 +17,12 @@ pub const EXIT_USAGE: u8 = 2;
 /// 运行期失败：bit 开始做事后失败或被取消（取消、非 TTY、无暂存、编辑器非 0）。
 pub const EXIT_RUNTIME: u8 = 1;
 
-/// 非 TTY 预检的中文报错。Windows 上 inquire 遇到非 TTY 不会自己失败（会渲染完一直等输入，
-/// 见 #5 的实测），这道检查因此由 bit 自己出。
+/// 非 TTY 预检的中文报错（#27 的 G1，三命令版）。Windows 上 inquire 遇到非 TTY 不会自己失败
+/// （会渲染完一直等输入，见 #5 的实测），这道检查因此由 bit 自己出。
 pub const ERR_NOT_A_TTY: &str =
-    "错误：stdin 不是终端 —— bit branch 与 bit commit 都是交互式的，请在终端里运行。";
+    "错误：stdin 不是终端 —— bit branch、bit commit 与 bit login 都是交互式的，请在终端里运行。";
 
-const USAGE_LINES: &str = "  bit branch    选类型 → 输名字 → 确认，然后 git switch -c\n  bit commit    选类型 / scope / breaking → 编辑器补 subject，然后 git commit";
+const USAGE_LINES: &str = "  bit branch    选类型 → 输名字 → 确认，然后 git switch -c\n  bit commit    选类型 / scope / breaking → 编辑器补 subject，然后 git commit\n  bit login     选提供商 / 填密钥 → 验证连通性，写入本机 AI 供给配置";
 
 const BRANCH_HELP: &str = "\
 bit branch
@@ -44,11 +46,23 @@ bit commit
 会调用：
   git commit -F <消息文件> --cleanup=strip";
 
-/// v0.1 的两个子命令。
+const LOGIN_HELP: &str = "\
+bit login
+
+选提供商 / 填密钥 → 验证连通性，写入本机 AI 供给配置。
+
+用法：
+  bit login
+
+会写入：
+  本机 AI 供给配置（路径与手改说明见 README「AI 配置」）";
+
+/// v0.2 的三个子命令。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
     Branch,
     Commit,
+    Login,
 }
 
 impl Command {
@@ -57,14 +71,16 @@ impl Command {
         match self {
             Command::Branch => "bit branch",
             Command::Commit => "bit commit",
+            Command::Login => "bit login",
         }
     }
 
-    /// 多余参数时给出的直路（#8 表第 5 行）。
+    /// 多余参数时给出的直路（#8 表第 5 行 / #27 的 login 行）。
     pub fn direct_hint(self) -> &'static str {
         match self {
             Command::Branch => "要直接建分支请用 git switch -c <名字>。",
             Command::Commit => "要直接提交请用 git commit。",
+            Command::Login => "要配置 AI 供给请直接运行 bit login。",
         }
     }
 }
@@ -106,7 +122,7 @@ impl UsageError {
                 format!("错误：没有指定命令\n用法：\n{USAGE_LINES}\n运行 bit --help 查看完整帮助。")
             }
             UsageError::UnknownCommand(name) => format!(
-                "错误：未知命令 `{name}`\nbit 只有 branch 与 commit 两个命令，都是交互式的，不转发其它 git 命令。\n运行 bit --help 查看用法。"
+                "错误：未知命令 `{name}`\nbit 只有 branch、commit 与 login 三个命令，都是交互式的，不转发其它 git 命令。\n运行 bit --help 查看用法。"
             ),
             UsageError::UnexpectedArg { command, arg } => match command {
                 Some(command) => format!(
@@ -120,7 +136,7 @@ impl UsageError {
     }
 }
 
-/// 手写参数解析（不引 clap）：只认 `branch` / `commit` / `-h|--help` / `-V|--version`。
+/// 手写参数解析（不引 clap）：只认 `branch` / `commit` / `login` / `-h|--help` / `-V|--version`。
 pub fn parse(args: &[String]) -> Outcome {
     let Some((first, rest)) = args.split_first() else {
         return Outcome::Usage(UsageError::MissingCommand);
@@ -130,6 +146,7 @@ pub fn parse(args: &[String]) -> Outcome {
         "-V" | "--version" => flag(Outcome::Version, rest),
         "branch" => command(Command::Branch, rest),
         "commit" => command(Command::Commit, rest),
+        "login" => command(Command::Login, rest),
         other => Outcome::Usage(UsageError::UnknownCommand(other.to_string())),
     }
 }
@@ -165,12 +182,12 @@ fn unexpected(command: Option<Command>, arg: &str) -> Outcome {
     })
 }
 
-/// 帮助正文（#8 表第 2 行）。
+/// 帮助正文（#8 表第 2 行 + #27 的三命令修订）。
 pub fn help_text() -> String {
     format!(
         "{VERSION_LINE}
 
-两个交互命令的 git 包装，不做透传。
+两个 git 包装命令与一个 AI 供给向导，不做透传。
 
 用法：
 {USAGE_LINES}
@@ -181,11 +198,12 @@ pub fn help_text() -> String {
     )
 }
 
-/// 子命令自己那一节（#8 Q2：用法 + 一句话 + 会调用哪条 git 命令）。
+/// 子命令自己那一节（#8 Q2：用法 + 一句话 + 会调用哪条 git 命令 / 会写入什么）。
 pub fn command_help(command: Command) -> &'static str {
     match command {
         Command::Branch => BRANCH_HELP,
         Command::Commit => COMMIT_HELP,
+        Command::Login => LOGIN_HELP,
     }
 }
 
@@ -215,7 +233,7 @@ mod tests {
         assert_eq!(parse_args(&[]), Outcome::Usage(UsageError::MissingCommand));
         assert_eq!(
             usage_text(parse_args(&[])),
-            "错误：没有指定命令\n用法：\n  bit branch    选类型 → 输名字 → 确认，然后 git switch -c\n  bit commit    选类型 / scope / breaking → 编辑器补 subject，然后 git commit\n运行 bit --help 查看完整帮助。"
+            "错误：没有指定命令\n用法：\n  bit branch    选类型 → 输名字 → 确认，然后 git switch -c\n  bit commit    选类型 / scope / breaking → 编辑器补 subject，然后 git commit\n  bit login     选提供商 / 填密钥 → 验证连通性，写入本机 AI 供给配置\n运行 bit --help 查看完整帮助。"
         );
     }
 
@@ -235,11 +253,12 @@ mod tests {
             format!(
                 "{VERSION_LINE}
 
-两个交互命令的 git 包装，不做透传。
+两个 git 包装命令与一个 AI 供给向导，不做透传。
 
 用法：
   bit branch    选类型 → 输名字 → 确认，然后 git switch -c
   bit commit    选类型 / scope / breaking → 编辑器补 subject，然后 git commit
+  bit login     选提供商 / 填密钥 → 验证连通性，写入本机 AI 供给配置
 
 选项：
   -h, --help     打印这份帮助
@@ -256,7 +275,7 @@ mod tests {
         );
         assert_eq!(
             usage_text(parse_args(&["add", "."])),
-            "错误：未知命令 `add`\nbit 只有 branch 与 commit 两个命令，都是交互式的，不转发其它 git 命令。\n运行 bit --help 查看用法。"
+            "错误：未知命令 `add`\nbit 只有 branch、commit 与 login 三个命令，都是交互式的，不转发其它 git 命令。\n运行 bit --help 查看用法。"
         );
     }
 
@@ -270,12 +289,17 @@ mod tests {
             usage_text(parse_args(&["commit", "-m", "x"])),
             "错误：bit commit 不接受参数（`-m`）\n要直接提交请用 git commit。"
         );
+        assert_eq!(
+            usage_text(parse_args(&["login", "foo"])),
+            "错误：bit login 不接受参数（`foo`）\n要配置 AI 供给请直接运行 bit login。"
+        );
     }
 
     #[test]
     fn bare_commands_run_and_help_flags_do_not() {
         assert_eq!(parse_args(&["branch"]), Outcome::Run(Command::Branch));
         assert_eq!(parse_args(&["commit"]), Outcome::Run(Command::Commit));
+        assert_eq!(parse_args(&["login"]), Outcome::Run(Command::Login));
         assert_eq!(
             parse_args(&["branch", "-h"]),
             Outcome::CommandHelp(Command::Branch)
@@ -284,8 +308,13 @@ mod tests {
             parse_args(&["commit", "--help"]),
             Outcome::CommandHelp(Command::Commit)
         );
+        assert_eq!(
+            parse_args(&["login", "-h"]),
+            Outcome::CommandHelp(Command::Login)
+        );
         assert!(command_help(Command::Branch).contains("git switch -c <名字>"));
         assert!(command_help(Command::Commit).contains("git commit -F <消息文件> --cleanup=strip"));
+        assert!(command_help(Command::Login).contains("本机 AI 供给配置"));
     }
 
     #[test]
@@ -311,6 +340,14 @@ mod tests {
                 arg: "foo".to_string()
             })
         );
+        assert_eq!(
+            parse_args(&["login", "-V"]),
+            Outcome::Usage(UsageError::UnexpectedArg {
+                command: Some(Command::Login),
+                arg: "-V".to_string()
+            }),
+            "`-h` / `-V` 只在命令后的第一个位置生效"
+        );
         assert!(matches!(parse_args(&["--"]), Outcome::Usage(_)));
     }
 
@@ -318,7 +355,7 @@ mod tests {
     fn non_tty_message_matches_the_frozen_table() {
         assert_eq!(
             ERR_NOT_A_TTY,
-            "错误：stdin 不是终端 —— bit branch 与 bit commit 都是交互式的，请在终端里运行。"
+            "错误：stdin 不是终端 —— bit branch、bit commit 与 bit login 都是交互式的，请在终端里运行。"
         );
     }
 }

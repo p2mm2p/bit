@@ -18,6 +18,7 @@ fn usage_failures_are_two_and_go_to_stderr() {
         &["add", "."][..],
         &["branch", "foo"][..],
         &["commit", "-m", "x"][..],
+        &["login", "foo"][..],
         &["--help", "foo"][..],
     ] {
         let run = fixture.run_bit(args);
@@ -40,6 +41,8 @@ fn help_and_version_are_requests() {
         &["--help"][..],
         &["branch", "-h"][..],
         &["commit", "--help"][..],
+        &["login", "-h"][..],
+        &["login", "--help"][..],
     ] {
         let run = fixture.run_bit(args);
         assert_eq!(run.code, 0, "bit {args:?} 的退出码");

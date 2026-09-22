@@ -13,8 +13,13 @@ use std::fs;
 use std::io;
 #[cfg(windows)]
 use std::io::IsTerminal;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use expectrl::Session;
@@ -238,6 +243,16 @@ impl Fixture {
             .expect("rev-list --count 是数字")
     }
 
+    /// bit 的 AI 配置文件（隔离环境里的 `BIT_CONFIG`）。
+    pub fn config_path(&self) -> PathBuf {
+        self.dir.path().join("config.toml")
+    }
+
+    /// 直接写一份配置文件（重配 / 坏配置用例）。
+    pub fn write_config(&self, contents: &str) {
+        fs::write(self.config_path(), contents).expect("写配置文件");
+    }
+
     /// 编辑器 stub 的模式：`write` = 每次写入消息；`quit` = 每次都不动文件就退出（vim 的 `:q`）。
     pub fn editor_mode(&self, mode: &str) {
         fs::write(self.stub_dir.join("mode"), mode).expect("写 stub 模式");
@@ -289,6 +304,18 @@ impl Fixture {
         cmd.env("HOME", self.dir.path());
         cmd.env("USERPROFILE", self.dir.path());
         cmd.env("XDG_CONFIG_HOME", self.dir.path().join("xdg"));
+        // bit 的 AI 配置也锁进沙箱：不设的话 login 会读 / 写穿开发机上的真配置
+        cmd.env("BIT_CONFIG", self.config_path());
+        for key in [
+            "BIT_AI_PROVIDER",
+            "BIT_AI_BASE_URL",
+            "BIT_AI_MODEL",
+            "BIT_AI_API_KEY",
+        ] {
+            cmd.env_remove(key);
+        }
+        // 本地 stub 不该被开发机上的代理环境变量绕过去（ureq 默认读代理）
+        cmd.env("NO_PROXY", "127.0.0.1,localhost");
         cmd.env("GIT_CONFIG_GLOBAL", self.dir.path().join("gitconfig"));
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -428,10 +455,26 @@ impl Pty {
     /// 出现之后还会等输出静一小会儿再返回：inquire 在提示之间要关掉又重开 raw 模式，
     /// 抢在它换模式的那一瞬间发按键会被控制台丢掉（实测：确认行停在原地、15s 都不动）。
     pub fn expect_screen(&mut self, needle: &str) {
+        self.expect_screen_with(needle, false);
+    }
+
+    /// 同 [`Pty::expect_screen`]，但先把网格上的自动折行拼回一行再找：
+    /// 长文案在 80 列里会断行，断点随路径长度变化，整句断言得先拿掉换行。
+    pub fn expect_screen_flat(&mut self, needle: &str) {
+        self.expect_screen_with(needle, true);
+    }
+
+    fn expect_screen_with(&mut self, needle: &str, flatten: bool) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             self.drain();
-            if self.screen().contains(needle) {
+            let screen = self.screen();
+            let haystack = if flatten {
+                screen.replace('\n', "")
+            } else {
+                screen
+            };
+            if haystack.contains(needle) {
                 self.settle();
                 return;
             }
@@ -586,4 +629,182 @@ fn poll_exit(session: &mut OsSession, _eof: bool) -> Option<i32> {
         Ok(code) => Some(code as i32),
         Err(_) => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// AI 供给 stub：login 的 e2e 拿它当「真 HTTP 端点」，全离线
+// ---------------------------------------------------------------------------
+
+/// 一条 stub 收到的请求（只取路由需要的两段）。
+pub struct AiRequest {
+    pub method: String,
+    pub path: String,
+}
+
+/// stub 的一次应答。
+pub struct AiReply {
+    pub status: u16,
+    pub body: String,
+}
+
+impl AiReply {
+    /// 200 + JSON 体。
+    pub fn ok(body: impl Into<String>) -> AiReply {
+        AiReply {
+            status: 200,
+            body: body.into(),
+        }
+    }
+
+    /// 指定状态码 + JSON 体（401 / 404 / 429 / 5xx 等）。
+    pub fn status(code: u16, body: impl Into<String>) -> AiReply {
+        AiReply {
+            status: code,
+            body: body.into(),
+        }
+    }
+}
+
+/// `GET /models` 的成功体。
+pub fn models_body(ids: &[&str]) -> String {
+    let entries: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}"}}"#)).collect();
+    format!(r#"{{"data":[{}]}}"#, entries.join(","))
+}
+
+/// `POST /chat/completions` 的成功体（验证只要求信封可用）。
+pub const CHAT_OK_BODY: &str = r#"{"choices":[{"message":{"content":"ok"}}]}"#;
+
+/// 本地 AI 供给 stub：一个 TcpListener，按闭包应答；Drop 时停服务、收线程。
+pub struct AiStub {
+    base_url: String,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl AiStub {
+    /// 起一个 loopback 上的假供给；`respond` 对每条请求给一次应答。
+    pub fn start<F>(respond: F) -> AiStub
+    where
+        F: Fn(&AiRequest) -> AiReply + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定 stub 端口");
+        let port = listener.local_addr().expect("读 stub 地址").port();
+        listener.set_nonblocking(true).expect("stub 非阻塞监听");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_stub(stream, &respond),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        AiStub {
+            base_url: format!("http://127.0.0.1:{port}"),
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    /// 填进 base_url 的地址。
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// 一个没有监听者的 loopback 地址（网络错误用例用）。
+    pub fn dead_base_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("借一个空闲端口");
+        let port = listener.local_addr().expect("读借来的地址").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+}
+
+impl Drop for AiStub {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 处理一条连接：读完请求 → 问闭包 → 写响应，随即关连接。
+fn serve_stub<F>(mut stream: TcpStream, respond: &F)
+where
+    F: Fn(&AiRequest) -> AiReply,
+{
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    // Windows 上 accept 出来的套接字会继承监听端的非阻塞模式，显式改回阻塞
+    stream.set_nonblocking(false).ok();
+    let Some(request) = read_http_request(&mut stream) else {
+        return;
+    };
+    let reply = respond(&request);
+    let reason = match reply.status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        _ => "Status",
+    };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        reply.body.len(),
+        reply.body,
+        status = reply.status
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+/// 读一条完整请求（头 + 按 Content-Length 读完请求体），只解析请求行。
+fn read_http_request(stream: &mut TcpStream) -> Option<AiRequest> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(_) => return None,
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&bytes[..head_end]).into_owned();
+            if bytes.len() >= head_end + 4 + http_content_length(&head) {
+                let line = head.lines().next()?;
+                let mut parts = line.split_whitespace();
+                return Some(AiRequest {
+                    method: parts.next()?.to_string(),
+                    path: parts.next()?.to_string(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// 请求头里的 Content-Length；缺头按 0 算（stub 只收 ureq 的请求）。
+fn http_content_length(head: &str) -> usize {
+    head.lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
