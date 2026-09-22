@@ -16,3 +16,7 @@
 - 光标落点由编辑器决定（vim 在第 1 行行首），用户自行到行尾补写；占位符方案因「忘了删就原样提交进历史」而被否。
 
 决定过程与实测证据（git 2.55.0.windows.5）见 [行为 · bit commit 细则](https://github.com/p2mm2p/bit/issues/4)。
+
+## 修订（v0.2）
+
+`bit commit --gen` 在编辑器定案后追加一次与菜单等价的合规复核（type ∈ 11 类、scope 合法、subject 非空）；不过则走同一有界回环（带原文重开、未改动即放弃）。人工路径仍只查 description 非空。理由：AI 产出的只是字段，draft 属于不可信输入，组装与文法复核仍由 bit 负责（见 [ADR-0004](./0004-ai-supply-is-external-and-explicit.md)）。

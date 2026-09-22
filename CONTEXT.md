@@ -1,6 +1,6 @@
 # bit
 
-两个交互命令的 git 包装（`bit branch` / `bit commit`）：bit 只负责「合规」——分支名照 Conventional Branch、提交消息照 Conventional Commits——执行与 git 自身的语义留给 git 本体。
+两个交互命令的 git 包装（`bit branch` / `bit commit`）与一个 AI 供给向导（`bit login`）：bit 只负责「合规」——分支名照 Conventional Branch、提交消息照 Conventional Commits——执行与 git 自身的语义留给 git 本体。
 
 ## 术语
 
@@ -58,6 +58,10 @@ _Avoid_: 空提交取消、空描述回环
 **AI 供给**：
 bit 调用大模型所需的本机配置（提供商、端点、模型、密钥），由 `bit login` 写入。没配置时「描述翻译」与「提交消息生成」不存在。
 _Avoid_: LLM 后端、模型配置
+
+**配置向导**：
+`bit login` 的本质——选提供商、掩码填密钥、试拉模型列表并验证连通性，写入「AI 供给」；不是账号登录，重跑即重配。
+_Avoid_: 登录、账号登录
 
 **未配置**：
 「AI 供给」不存在（从未配置过）。AI 能力不存在；v0.1 两条路径零回归。

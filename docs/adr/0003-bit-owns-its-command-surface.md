@@ -18,3 +18,7 @@ bit 只有两个命令、没有任何透传，于是「怎么被调用」这件�
 - 交互界面渲染到 stderr（inquire 的现状），stdout 只承载 git 的输出——管道的消费者拿到的仍是纯 git 语义。
 
 决定过程与实测证据（git 2.55.0.windows.5、cargo 1.98.1、gh 2.98.0）见 [命令面 · 帮助、错误与文案语言](https://github.com/p2mm2p/bit/issues/8)。
+
+## 修订（v0.2）
+
+命令面从两个命令扩为三个：新增 `bit login`（AI 供给配置向导）与 `bit commit --gen`（唯一选项拼法；`bit commit --gen -h` 落多余参数出口）。三层退出码与记忆点不变——AI 失败（未配置 / 配置错误 / 生成失败）一律运行期 1，翻译失败落回名字输入、不是退出点。新增与修订文案冻结在 [命令面 · v0.2 增补](https://github.com/p2mm2p/bit/issues/27)。
